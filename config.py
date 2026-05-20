@@ -5,8 +5,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.absolute()
 
 # LLM 配置
-# 默认路径: "Qwen/Qwen3-4B" /Users/xing/AI/Project/LLM/qwen/Qwen3-4B
-LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "Qwen/Qwen3-4B")
+# 默认模型: "qwen3:4b"
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama3.2:3b")
 
 # ASR 配置
 # 默认模型: "iic/SenseVoiceSmall"
@@ -20,6 +20,9 @@ TTS_CONFIG = {
     "voice": str(TTS_MODEL_DIR / "voices-v1.1-zh.bin"),
     "vocab": str(TTS_MODEL_DIR / "config-v1.1-zh.json")
 }
+
+# VAD 配置
+VAD_SILENCE_THRESHOLD_MS = int(os.getenv("VAD_SILENCE_THRESHOLD_MS", "350"))
 
 # 其他配置
 OUTPUT_DIR = BASE_DIR / "outputs"

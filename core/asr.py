@@ -1,38 +1,99 @@
 from funasr import AutoModel
-from funasr.utils.postprocess_utils import rich_transcription_postprocess
-import config
+import numpy as np
+import time
+
 
 class ASRWrapper:
     
-    def __init__(self, model_dir=config.ASR_MODEL_PATH, device="mps", vad_model="fsmn-vad"):
-        self.model_dir = model_dir
-        self.device = device
-        self.vad_model = vad_model
+    def __init__(self, model_dir="paraformer-zh-streaming", device="mps"):
+        print("正在初始化流式 ASR 模型 (paraformer-zh-streaming)...")
+        self.chunk_size = [0, 10, 5]  # 600ms
+        self.encoder_chunk_look_back = 4
+        self.decoder_chunk_look_back = 1
         
-        print("正在初始化ASR模型...")
         self.model = AutoModel(
-            model=self.model_dir,
-            trust_remote_code=True,
-            remote_code="./model.py",    
-            vad_model=self.vad_model,
-            vad_kwargs={"max_single_segment_time": 30000},
-            device=self.device,
+            model=model_dir,
+            model_revision="v2.0.4",
+            device=device,
+            disable_pbar=True,
+            disable_update=True
         )
-    
-    def transcribe(self, wav_dir, language="auto", use_itn=True, batch_size_s=60, 
-                   merge_vad=True, merge_length_s=15):
-        print("正在开始ASR识别")
-        res = self.model.generate(
-            input=wav_dir,
-            cache={},
-            language=language,
-            use_itn=use_itn,
-            batch_size_s=batch_size_s,
-            merge_vad=merge_vad,
-            merge_length_s=merge_length_s,
-        )
+
+    def transcribe(self, audio_input, cache=None, is_final=False):
+        """
+        流式 ASR 识别 - PCM 直连 (无需 ffmpeg)
+        audio_input: np.ndarray float32, 16kHz 单声道 PCM
+        cache: 外部维护的状态字典:
+               cache["model_cache"]    -> FunASR 模型内部状态
+               cache["last_pcm_length"] -> 游标
+               cache["leftover_pcm"]    -> 残留样本
+        """
+        start = time.time()
+        if cache is None:
+            cache = {}
+        if "model_cache" not in cache:
+            cache["model_cache"] = {}
+            
+        try:
+            full_pcm = audio_input
+            
+            # 游标机制：只处理新增样本
+            last_processed = cache.get("last_pcm_length", 0)
+            if len(full_pcm) <= last_processed:
+                return "", time.time() - start
+            
+            new_samples = full_pcm[last_processed:]
+            cache["last_pcm_length"] = len(full_pcm)
+            
+            # 与上次残留样本拼接
+            leftover = cache.get("leftover_pcm", np.array([], dtype=np.float32))
+            samples = np.concatenate([leftover, new_samples])
+            
+            chunk_stride = self.chunk_size[1] * 960  # 9600 样本 = 600ms
+            
+            if len(samples) == 0:
+                return "", time.time() - start
+            
+            text = ""
+            total = len(samples)
+            i = 0
+            
+            while i + chunk_stride <= total:
+                chunk = samples[i:i + chunk_stride]
+                chunk_final = is_final and (i + chunk_stride * 2 > total)
+                
+                res = self.model.generate(
+                    input=chunk,
+                    cache=cache["model_cache"],
+                    is_final=chunk_final,
+                    chunk_size=self.chunk_size,
+                    encoder_chunk_look_back=self.encoder_chunk_look_back,
+                    decoder_chunk_look_back=self.decoder_chunk_look_back
+                )
+                if res and len(res) > 0 and "text" in res[0]:
+                    text += res[0]["text"]
+                i += chunk_stride
+            
+            # 处理 is_final 时的尾巴
+            if is_final and i < total:
+                res = self.model.generate(
+                    input=samples[i:],
+                    cache=cache["model_cache"],
+                    is_final=True,
+                    chunk_size=self.chunk_size,
+                    encoder_chunk_look_back=self.encoder_chunk_look_back,
+                    decoder_chunk_look_back=self.decoder_chunk_look_back
+                )
+                if res and len(res) > 0 and "text" in res[0]:
+                    text += res[0].get("text", "")
+                cache["leftover_pcm"] = np.array([], dtype=np.float32)
+            else:
+                cache["leftover_pcm"] = samples[i:]
+            
+        except Exception as e:
+            import traceback
+            print(f"[ASR] 识别异常: {e}")
+            traceback.print_exc()
+            return "", 0.0
         
-        text = rich_transcription_postprocess(res[0]["text"])
-        print("ASR识别结束")
-        return text
-    
+        return text, time.time() - start

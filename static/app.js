@@ -68,139 +68,321 @@ function initAudioContext() {
         micDataArray = new Uint8Array(micAnalyser.frequencyBinCount);
         
         isAudioInit = true;
+        
+        // ====== 直接连接到 destination，让浏览器接管标准 AEC 流同步 ======
+        analyser.connect(audioContext.destination);
     }
     if (audioContext.state === 'suspended') {
         audioContext.resume();
     }
 }
 
-// ... (Create initMicAudio helper if needed, but handled in record logic)
-
-// 录音逻辑中:
-// source.connect(micAnalyser); 
-
-// 动画循环中:
-// if (isRecording) { micAnalyser.getByteFrequencyData(micDataArray); ... use micDataArray }
-// else if (isPlaying) { analyser.getByteFrequencyData(dataArray); ... use dataArray }
-
 // --- 3. LOGIC & INTERACTION ---
 const recordBtn = document.getElementById('record-btn');
 const textInput = document.getElementById('text-input');
 const sendBtn = document.getElementById('send-btn');
-const chatHistory = document.getElementById('chat-history');
+const activeMessageZone = document.getElementById('active-message-zone');
 const statusDisplay = document.getElementById('status-display');
+const latencyDisplay = document.getElementById('latency-display');
+const clearHistoryBtn = document.getElementById('clear-history-btn');
 const audioPlayer = document.getElementById('audio-player');
-const clearHistoryBtn = document.getElementById('clear-history');
 
 // 录音相关
-let mediaRecorder;
-let audioChunks = [];
 let isRecording = false;
-let isAlwaysListening = false; // 持续监听模式
-let silenceStartTime = null;
-const SILENCE_THRESHOLD = 15; // 静音阈值 (根据实际环境调整)
-const SILENCE_DURATION = 1000; // 静音持续时间 (ms)
+let currentSessionId = null; // 当前正在进行的会话ID
+let ws = null;
+let isWsConnected = false;
 
-// 开启录音函数
+// --- WebSocket 初始化 ---
+function initWebSocket() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    
+    ws = new WebSocket(wsUrl);
+    
+    ws.onopen = () => {
+        console.log("WebSocket connected");
+        isWsConnected = true;
+        setStatus('READY');
+    };
+    
+    ws.onclose = () => {
+        console.log("WebSocket disconnected");
+        isWsConnected = false;
+        setStatus('DISCONNECTED');
+        // 3秒后尝试重连
+        setTimeout(initWebSocket, 3000);
+    };
+    
+    ws.onerror = (err) => {
+        console.error("WebSocket error:", err);
+        isWsConnected = false;
+    };
+    
+    ws.onmessage = (event) => {
+        handleWsMessage(event.data);
+    };
+}
+
+// 处理 WS 消息
+function handleWsMessage(dataStr) {
+    try {
+        const data = JSON.parse(dataStr);
+        
+        if (data.type === 'start') {
+            setStatus('PROCESSING...', 'busy');
+            currentSessionId = data.session_id;
+            assistantMsgEl = null;
+            fullContent = "";
+        } else if (data.type === 'asr') {
+            console.log("WS ASR Result:", data.text);
+            // 实时识别出结果时本地流式拼接展示
+            handleAsrChunk(data.text);
+            lastAsrTime = Date.now();
+        } else if (data.type === 'interrupt') {
+            console.log("Receive Interrupt Signal from Server");
+            finalizeInterrupt(); // 瞬间静音并清空队列
+        } else if (data.type === 'text') {
+            handleTextChunk(data.content);
+        } else if (data.type === 'audio') {
+            if (data.session_id && data.session_id !== currentSessionId) {
+                console.log("Ignored stale audio chunk from previous response");
+                return;
+            }
+            handleAudioChunk(data);
+        } else if (data.type === 'end') {
+            const assistantMsgEl = document.querySelector('.active-bubble.assistant.typing');
+            if (assistantMsgEl) assistantMsgEl.classList.remove('typing');
+            setStatus('READY');
+        } else if (data.type === 'error') {
+            console.error("Server Error:", data.message);
+            setStatus('ERROR');
+        }
+    } catch (e) {
+        console.error("Failed to parse WS message:", e);
+    }
+}
+
+let assistantMsgEl = null;
+let fullContent = "";
+
+let userMsgEl = null;
+let fullUserContent = "";
+
+function handleAsrChunk(text) {
+    if (!userMsgEl) {
+        userMsgEl = addMessage('user', '');
+    }
+    fullUserContent += text;
+    const contentDiv = userMsgEl.querySelector('.content');
+    contentDiv.textContent = fullUserContent;
+}
+
+function handleTextChunk(content) {
+    if (!assistantMsgEl) {
+        assistantMsgEl = addMessage('assistant', '');
+    }
+    fullContent += content;
+    const contentDiv = assistantMsgEl.querySelector('.content');
+    contentDiv.textContent = fullContent;
+}
+
+let firstAudioReported = false;
+
+function decodeBase64ToFloat32Array(base64) {
+    const binary_string = window.atob(base64);
+    const len = binary_string.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binary_string.charCodeAt(i);
+    }
+    return new Float32Array(bytes.buffer);
+}
+
+function handleAudioChunk(data) {
+    if (!firstAudioReported) {
+        updateLatency(latencyStartTime);
+        firstAudioReported = true;
+    }
+    
+    const float32Data = decodeBase64ToFloat32Array(data.audio_data);
+    audioQueue.push({
+        buffer: float32Data,
+        sampleRate: data.sample_rate || 24000,
+        text: data.text
+    });
+    
+    if (!isPlaying) {
+        playNextAudio();
+    }
+}
+
+// 页面加载即初始化
+initWebSocket();
+
+// 录音相关
+let currentMicStream = null;
+let pcmWorklet = null; // AudioWorklet 节点
+let workletModuleLoaded = false;
+
 async function startRecording() {
     if (isRecording) return;
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream);
-        audioChunks = [];
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            audio: { 
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: false, // 关闭自动增益，保持麦克风音量平稳
+                channelCount: 1
+            } 
+        });
+        currentMicStream = stream;
         
-        mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
+        // 发送启动指令
+        if (isWsConnected) {
+            ws.send(JSON.stringify({ type: 'control', action: 'start' }));
+        }
         
-        mediaRecorder.onstop = async () => {
-            // 停止麦克风流的所有轨道
-            stream.getTracks().forEach(track => track.stop());
-            
-            const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-            setStatus('UPLOADING...', 'busy');
-            
-            const formData = new FormData();
-            formData.append('audio', audioBlob, 'recording.wav');
-            
-            try {
-                const response = await fetch('/audio', {
-                    method: 'POST',
-                    body: formData
-                });
-                handleStream(response);
-            } catch (e) {
-                console.error(e);
-                setStatus('ERROR', 'busy');
-                // 如果出错且在持续模式，过会儿重试？或者直接报错
-            }
-        };
-        
-        mediaRecorder.start();
         isRecording = true;
         recordBtn.classList.add('recording');
         setStatus('LISTENING...', 'busy');
-        silenceStartTime = null; 
         
         // 连接可视化
         initAudioContext();
+        
+        const hpf = audioContext.createBiquadFilter();
+        hpf.type = 'highpass';
+        hpf.frequency.value = 80; // 从 200 改为 80，保留人声低频能量
+        
         const source = audioContext.createMediaStreamSource(stream);
-        source.connect(micAnalyser); 
+        source.connect(hpf);
+        hpf.connect(micAnalyser); // 可视化
+        
+        // 用 AudioWorklet 直接捕获 16kHz Int16 PCM，跳过 WebM 编解码
+        if (!workletModuleLoaded) {
+            await audioContext.audioWorklet.addModule('/static/pcm-processor.js');
+            workletModuleLoaded = true;
+        }
+        pcmWorklet = new AudioWorkletNode(audioContext, 'pcm-processor');
+        pcmWorklet.port.onmessage = (e) => {
+            if (isWsConnected && isRecording) {
+                // 恢复无条件发包机制，允许随时 100% 全双工打断
+                ws.send(e.data); // 发送原始 PCM Int16 二进制
+            }
+        };
+        hpf.connect(pcmWorklet);
+        // 连接到静音输出以保持 worklet 在音频图中活跃
+        const silentGain = audioContext.createGain();
+        silentGain.gain.value = 0;
+        pcmWorklet.connect(silentGain);
+        silentGain.connect(audioContext.destination);
         
     } catch (e) {
         console.error('Mic error:', e);
         alert('无法访问麦克风');
-        isAlwaysListening = false;
         recordBtn.classList.remove('active');
     }
 }
 
 // 停止录音函数
 function stopRecording() {
-    if (isRecording && mediaRecorder && mediaRecorder.state !== 'inactive') {
-        mediaRecorder.stop();
-        isRecording = false;
-        recordBtn.classList.remove('recording');
-        silenceStartTime = null;
+    if (pcmWorklet) {
+        pcmWorklet.disconnect();
+        pcmWorklet = null;
     }
+    isRecording = false;
+    recordBtn.classList.remove('recording');
+    
+    // 释放麦克风
+    if (currentMicStream) {
+        currentMicStream.getTracks().forEach(track => track.stop());
+        currentMicStream = null;
+    }
+    
+    setStatus('READY');
 }
 
 // 音频播放队列
 let audioQueue = [];
 let isPlaying = false;
-let currentAudioSource = null; // 用于 WebAudio 连接
+let currentAudioSource = null;
 
 // 状态更新
 function setStatus(status, type = 'normal') {
     statusDisplay.textContent = status;
     const dot = document.querySelector('.status-dot');
-    dot.className = 'status-dot ' + (type === 'busy' ? 'busy' : 'healthy');
+    if (dot) {
+        dot.className = 'status-dot ' + (type === 'busy' ? 'busy' : 'healthy');
+    }
+}
+
+// 正式确认打断：ASR 识别到有效文字，清空队列并停止旧生成
+async function finalizeInterrupt() {
+    console.log("Finalizing interruption (ASR confirmed text).");
+    
+    if (currentAudioSource) {
+        const source = currentAudioSource;
+        currentAudioSource = null;
+        try {
+            source.onended = null; // 防止停播触发下一首
+            source.stop();
+        } catch (e) {}
+        source.disconnect();
+    }
+    
+    audioQueue = []; // 彻底清空待播放队列
+    isPlaying = false;
+    
+    // 如果有正在进行的后端生成，通知其停止
+    if (currentSessionId) {
+        currentSessionId = null; 
+    }
+    
+    assistantMsgEl = null;
+    fullContent = "";
+    
+    setStatus('INTERRUPTED');
 }
 
 // 消息展示
-function addMessage(role, content) {
-    const div = document.createElement('div');
-    div.className = `message ${role}`;
-    
-    // 如果是流式更新（仅助手）
-    if (role === 'assistant' && document.querySelector('.message.assistant.typing')) {
-        const typingMsg = document.querySelector('.message.assistant.typing');
-        const contentDiv = typingMsg.querySelector('.message-content');
-        contentDiv.textContent += content;
-        chatHistory.scrollTop = chatHistory.scrollHeight;
-        return typingMsg;
-    }
+let lastAsrTime = 0;
+let latencyStartTime = 0;
 
-    div.innerHTML = `
-        <div class="role-label">${role === 'user' ? 'USER' : 'AI CORE'}</div>
-        <div class="message-content">${content}</div>
-    `;
+function addMessage(role, content) {
+    // 沉浸式设计：右上角只保留一个活跃的气泡
+    activeMessageZone.innerHTML = '';
+    
+    // 清除打架的缓存节点引用，强制界面只更新当前活跃角色
+    if (role === 'assistant') {
+        userMsgEl = null;
+        fullUserContent = "";
+    } else if (role === 'user') {
+        assistantMsgEl = null;
+        fullContent = "";
+    }
+    
+    const div = document.createElement('div');
+    div.className = `active-bubble ${role}`;
+    
+    div.innerHTML = `<div class="content">${content}</div>`;
     
     if (role === 'assistant' && !content) {
-        div.classList.add('typing'); // 标记为正在输入
+        div.classList.add('typing');
     }
     
-    chatHistory.appendChild(div);
-    chatHistory.scrollTop = chatHistory.scrollHeight;
+    activeMessageZone.appendChild(div);
     return div;
+}
+
+function updateLatency(startTime) {
+    const baseTime = lastAsrTime || startTime;
+    if (baseTime > 0) {
+        const latency = Date.now() - baseTime;
+        latencyDisplay.textContent = `LATENCY: ${latency}ms`;
+        lastAsrTime = 0; // 重置
+    }
 }
 
 // 播放音频队列
@@ -208,133 +390,76 @@ async function playNextAudio() {
     if (audioQueue.length === 0) {
         isPlaying = false;
         setStatus('WAITING FOR INPUT...');
-        
-        // --- 持续监听模式的关键点 ---
-        if (isAlwaysListening) {
-            console.log("Continuous Mode: Playback finished, restarting listener...");
-            setTimeout(startRecording, 500); // 稍微延迟一下，避免回音干扰
-        }
         return;
     }
 
     isPlaying = true;
     const audioData = audioQueue.shift();
-    const url = audioData.url;
     
     // 连接到 WebAudio 以驱动可视化
     initAudioContext();
     
-    audioPlayer.src = url;
-    audioPlayer.crossOrigin = "anonymous";
-    
-    // 等待加载
-    await new Promise((resolve) => {
-        audioPlayer.oncanplaythrough = resolve;
-    });
-
-    // 创建源并连接
-    if (!currentAudioSource) {
-        // fix: 只需要创建一次
-        try {
-            const source = audioContext.createMediaElementSource(audioPlayer);
-            source.connect(analyser);
-            analyser.connect(audioContext.destination);
-            currentAudioSource = source; 
-        } catch (e) {
-            // ignore if already connected
-        }
+    // 确保 AudioContext 在播放前是激活的
+    if (audioContext && audioContext.state === 'suspended') {
+        await audioContext.resume();
     }
-    
-    audioPlayer.play();
-    setStatus('SPEAKING...', 'busy');
 
-    audioPlayer.onended = () => {
-        playNextAudio();
-    };
-}
+    try {
+        const audioBuffer = audioContext.createBuffer(1, audioData.buffer.length, audioData.sampleRate);
+        audioBuffer.getChannelData(0).set(audioData.buffer);
 
-// 处理 SSE 流
-async function handleStream(response) {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    
-    let assistantMsgEl = addMessage('assistant', ''); // 创建空的助手消息
-    
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
         
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n\n');
+        // 挂载到 analyser 以驱动球体跳动及频谱
+        source.connect(analyser); 
         
-        for (const line of lines) {
-            if (line.startsWith('data: ')) {
-                try {
-                    const data = JSON.parse(line.slice(6));
-                    
-                    if (data.type === 'start') {
-                        setStatus('PROCESSING...', 'busy');
-                    } else if (data.type === 'text') {
-                        // 更新文本显示
-                        const contentDiv = assistantMsgEl.querySelector('.message-content');
-                        contentDiv.textContent += data.content;
-                        chatHistory.scrollTop = chatHistory.scrollHeight;
-                    } else if (data.type === 'audio') {
-                        // 添加到播放队列
-                        audioQueue.push(data);
-                        if (!isPlaying) {
-                            playNextAudio();
-                        }
-                    } else if (data.type === 'asr') {
-                        // 显示识别到的用户文本
-                        addMessage('user', data.text);
-                    } else if (data.type === 'end') {
-                        assistantMsgEl.classList.remove('typing');
-                    }
-                } catch (e) {
-                    console.error('Parse error:', e);
-                }
+        currentAudioSource = source;
+
+        source.onended = () => {
+            if (currentAudioSource === source) {
+                currentAudioSource = null;
+                playNextAudio();
             }
-        }
+        };
+
+        setStatus('SPEAKING...', 'busy');
+        source.start(0);
+    } catch (e) {
+        console.error("Playback failed:", e);
+        playNextAudio();
     }
 }
 
-// 发送文本
+// 修改文字发送支持 WebSocket 全双工
 async function sendText() {
     const text = textInput.value.trim();
-    if (!text) return;
+    if (!text || !isWsConnected) return;
     
     textInput.value = '';
     addMessage('user', text);
     setStatus('THINKING...', 'busy');
+    latencyStartTime = Date.now();
     
-    try {
-        const response = await fetch('/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: text })
-        });
-        
-        handleStream(response);
-    } catch (e) {
-        console.error(e);
-        setStatus('ERROR', 'busy');
-    }
+    assistantMsgEl = null;
+    fullContent = "";
+    firstAudioReported = false;
+
+    // 文字发送也触发正式打断
+    finalizeInterrupt();
+    
+    ws.send(JSON.stringify({ type: 'chat', text: text }));
 }
 
 // 录音逻辑
 if (navigator.mediaDevices) {
     recordBtn.addEventListener('click', () => {
-        if (!isAlwaysListening) {
-            // 切换到持续监听模式
-            isAlwaysListening = true;
-            recordBtn.classList.add('active'); // CSS中可以增加一个 active 状态表示开启了循环
+        if (!isRecording) {
+            recordBtn.classList.add('active');
             const label = recordBtn.querySelector('.btn-label');
-            if (label) label.textContent = 'ALWAYS LISTENING';
+            if (label) label.textContent = 'STOP RECORDING';
             startRecording();
         } else {
-            // 关闭持续监听模式
-            isAlwaysListening = false;
             recordBtn.classList.remove('active');
             const label = recordBtn.querySelector('.btn-label');
             if (label) label.textContent = 'TAP TO SPEAK';
@@ -396,6 +521,11 @@ function animate() {
         if (isRecording) {
             micAnalyser.getByteFrequencyData(micDataArray);
             currentData = micDataArray;
+            
+            // 同时获取当前正在播放的能量，用于回声掩蔽
+            if (isPlaying) {
+                analyser.getByteFrequencyData(dataArray);
+            }
         } else {
             analyser.getByteFrequencyData(dataArray);
             currentData = dataArray;
@@ -403,19 +533,6 @@ function animate() {
 
         const overallSum = currentData.reduce((a, b) => a + b, 0);
         avgTarget = overallSum / currentData.length;
-        
-        // VAD: 自动静音检测
-        if (isRecording) {
-            if (avgTarget < SILENCE_THRESHOLD) {
-                if (!silenceStartTime) silenceStartTime = Date.now();
-                if (Date.now() - silenceStartTime > SILENCE_DURATION) {
-                    console.log("VAD: 1s silence detected, auto-stopping...");
-                    stopRecording();
-                }
-            } else {
-                silenceStartTime = null;
-            }
-        }
 
         bassTarget = currentData[5] / 255;
         drawMonitor(currentData);
@@ -492,7 +609,7 @@ if (textInput) {
 if (clearHistoryBtn) {
     clearHistoryBtn.addEventListener('click', async () => {
         await fetch('/history', { method: 'DELETE' });
-        chatHistory.innerHTML = '';
+        activeMessageZone.innerHTML = '';
         setStatus('HISTORY CLEARED');
     });
 }
